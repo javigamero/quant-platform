@@ -12,10 +12,12 @@ ownership.
 ```
 quant-platform/
 ├── data-etl/          # PySpark + Jupyter ETL pipelines (medallion architecture)
-│   ├── scripts/       # ingestion notebooks, organised by DWH layer
-│   ├── validations/   # infrastructure smoke tests
-│   ├── modules/       # reusable PySpark helpers
-│   └── pipelines/     # pipeline definitions / DAGs
+│   ├── configs/       # configuration files
+│   ├── docs/          # documentation files to explain
+│   ├── resources/     # resources definitions / DAGs, etc
+│   ├── scripts/       # ingestion notebooks, organized by DWH layer
+│   ├── src/           # reusable PySpark helpers
+│   └── tests/         # etl test files
 │
 ├── models/            # PyTorch model definitions, training loops, experiment tracking
 │   ├── definitions/   # model architectures
@@ -35,16 +37,7 @@ quant-platform/
 
 ## Getting started
 
-Spin up the infrastructure first:
-
-```sh
-cd ../quant-infrastructure
-cp .env.example .env   # fill in credentials
-docker compose up --build
-```
-
-Then work inside Jupyter at http://localhost:8888. The `quant-platform/`
-directory is mounted into the Spark container at `/home/jovyan/work`.
+TODO Redefining... 
 
 ## Branch strategy
 
