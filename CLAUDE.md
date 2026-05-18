@@ -30,6 +30,31 @@ Example: `data-etl/scripts/dwh/i_origin_to_bronze/extract_intraday_series.ipynb`
 
 New extraction notebooks go under `i_origin_to_bronze/`, grouped by data source (e.g. `alpha_vantage/`, `alpaca/`).
 
+## Coding style Convention
+Coding style is PEP8, please follow the next rules: 
+* Classes: `PascalCase`
+* Variables and functions: `snake_case`
+* Constants: `UPPER_SNAKE_CASE`
+* Private/Internal: leading underscore, 
+* Modules & Packages: short, `snake_case`
+* Booleans: `snake_case` and prefix with `is`, `has`, `can`, etc. 
+
+## Tables/Columns naming convention: 
+Tables and columns naming follow the next convention: 
+* table names: 
+  * `snake_case` 
+  * prefix with `dim_`, `fact_` following Kimball dimensional modeling. 
+  * plural nouns after prefix, for instance: `dim_products`
+* columns names: 
+  * `snake_case`
+  * booleans named with prefix `is`, `has`, `can`, etc.
+  * use `id` for primary key column 
+  * use `_id` for foreign keys, for example: `user_id`. 
+  * use `_at` for timetamps columns
+  * use `_date` for date only columns
+  * use `_time` for time only 
+  * use `_year`. `_month`. `_day` for extracted parts.
+
 ## Shared modules
 
 `shared/` contains cross-cutting code imported across all three layers:
