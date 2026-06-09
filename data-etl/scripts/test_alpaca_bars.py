@@ -6,7 +6,7 @@ load_dotenv()
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.alpaca import MarketData
+from src.extractions.alpaca import MarketData
 
 SYMBOL = "AAPL"
 START = "2025-01-01"
