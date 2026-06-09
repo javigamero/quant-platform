@@ -1,0 +1,19 @@
+name: Data ETL Unit Tests
+
+on:
+  push:
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: data-etl/requirements-dev.txt
+      - run: pip install -r data-etl/requirements-dev.txt
+      - run: pytest data-etl/tests/unit/ -v
