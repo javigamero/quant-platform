@@ -83,6 +83,10 @@ class TestParseBars:
         assert row["vwap"] == pytest.approx(246.47)
 
 
+@pytest.mark.skipif(
+    not all(_CREDENTIALS.values()),
+    reason="Alpaca credentials not set — set APCA-API-KEY-ID and APCA-API-SECRET-KEY to run",
+)
 class TestGetBars:
     """Live API tests — require valid APCA credentials and network access."""
 
