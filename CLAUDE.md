@@ -22,13 +22,17 @@ Scripts are organized under `data-etl/scripts/dwh/` by DWH layer using a naming 
 
 | Prefix | Layer | Description |
 |---|---|---|
-| `i_` | origin → bronze | Raw ingestion from external APIs to MinIO Delta tables |
-| `ii_` | bronze → silver | Cleaning, typing, deduplication _(planned)_ |
+| `i_` | origin → bronze | Raw ingestion from external APIs to the Parquet lake |
+| `ii_` | bronze → silver | Calendar alignment, adjustment, validation |
 | `iii_` | silver → gold | Feature engineering, model-ready outputs _(planned)_ |
 
-Example: `data-etl/scripts/dwh/i_origin_to_bronze/extract_intraday_series.ipynb`
+Example: `data-etl/scripts/dwh/i_origin_to_bronze/alpaca/extract_aapl_1min_bars.ipynb`
 
 New extraction notebooks go under `i_origin_to_bronze/`, grouped by data source (e.g. `alpha_vantage/`, `alpaca/`).
+
+Notebooks stay thin: the logic lives in `data-etl/src/dwh/<layer>/`, which is unit-tested
+under `data-etl/tests/unit/`. Schemas are versioned in `data-etl/src/dwh/schemas.py` and
+documented in `data-etl/configs/data_contracts/`.
 
 ## Coding style Convention
 Coding style is PEP8, please follow the next rules: 
