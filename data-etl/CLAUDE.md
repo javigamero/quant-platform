@@ -18,11 +18,24 @@ partitioning) lives in the layer jobs under `src/dwh/`, not in the client.
 
 | Module | Produces |
 |---|---|
-| `src.dwh.bronze.alpaca_bars` | `bronze/fact_bars_raw` |
-| `src.dwh.bronze.alpaca_reference` | `bronze/dim_market_calendar`, `bronze/dim_corporate_actions` |
-| `src.dwh.silver.bars_1m` | `silver/fact_bars_1m` |
-| `src.dwh.schemas` | Versioned Arrow contracts + `cast_to_schema` / `to_pandas` |
-| `src.storage.lake` | Partitioned Parquet writes, idempotent per partition |
+| `src.dwh.bronze.alpaca_bars` | `lakehouse.bronze.fact_bars_raw` |
+| `src.dwh.bronze.alpaca_reference` | `lakehouse.bronze.dim_market_calendar`, `lakehouse.bronze.dim_corporate_actions` |
+| `src.dwh.silver.bars_1m` | `lakehouse.silver.fact_bars_1m` |
+| `src.dwh.schemas` | Versioned Arrow contracts + `cast_to_schema` / `align_to_schema` / `to_pandas` |
+| `src.storage.catalog` | Unity Catalog registration + partitioned Delta writes, idempotent per partition |
+
+## Storage
+
+Every table is an **external Delta table registered in Unity Catalog**, written with
+`deltalake` (delta-rs) so the jobs stay pure pandas/pyarrow, and read by Spark through the
+`unitycatalog-spark` connector as `lakehouse.<layer>.<table>`.
+
+* The catalog owns the location: jobs call `UnityCatalog.register_table` / `read_table` and
+  never build a path. `LAKEHOUSE_ROOT` only decides where a *new* table is laid out.
+* Configuration comes from `UNITY_CATALOG_URI`, `UNITY_CATALOG_NAME`, `LAKEHOUSE_ROOT`.
+  Every job takes an optional `lakehouse=` handle; tests inject one over a tmp dir.
+* Storage types are the ones Delta has: no TIME (calendar bounds are `'HH:MM'` strings) and
+  one UTC-normalised timestamp type (`schemas.align_to_schema` re-attaches ET on read).
 
 Decimal is the storage type for prices; `schemas.to_pandas` widens it to `float64` for
 compute, because Arrow otherwise hands back `Decimal` objects that break arithmetic.

@@ -17,15 +17,19 @@ import pandas as pd
 
 from src.dwh import schemas
 from src.dwh.bronze.alpaca_bars import to_utc_timestamp
-from src.storage import lake
+from src.storage.catalog import UnityCatalog, get_catalog
 
 _LOGGER = logging.getLogger(__name__)
 
 REGULAR_CLOSE_ET = time(16, 0)
+ET_TIME_FORMAT = "%H:%M"
 
 
 def build_market_calendar(calendar: pd.DataFrame, ingested_at: datetime=None):
     """Types the `/v2/calendar` response and derives session length and early-close flag.
+
+    The session bounds are stored as `'HH:MM'` strings: Delta has no TIME type, and
+    `read_market_calendar` parses them back into `datetime.time` for compute.
 
     Parameters
     ----------
@@ -41,13 +45,14 @@ def build_market_calendar(calendar: pd.DataFrame, ingested_at: datetime=None):
 
     frame = calendar.copy()
     frame["session_date"] = pd.to_datetime(frame["session_date"]).dt.date
-    frame["open_et"] = frame["open_et"].map(parse_et_time)
-    frame["close_et"] = frame["close_et"].map(parse_et_time)
+    open_et = frame["open_et"].map(parse_et_time)
+    close_et = frame["close_et"].map(parse_et_time)
     frame["session_minutes"] = [
-        _minutes_between(open_et, close_et)
-        for open_et, close_et in zip(frame["open_et"], frame["close_et"])
+        _minutes_between(open_time, close_time) for open_time, close_time in zip(open_et, close_et)
     ]
-    frame["is_half_day"] = frame["close_et"] < REGULAR_CLOSE_ET
+    frame["is_half_day"] = close_et < REGULAR_CLOSE_ET
+    frame["open_et"] = open_et.map(format_et_time)
+    frame["close_et"] = close_et.map(format_et_time)
     frame["settlement_date"] = pd.to_datetime(frame.get("settlement_date"), errors="coerce").dt.date
     frame["ingested_at"] = to_utc_timestamp(ingested_at or datetime.now(timezone.utc))
 
@@ -69,8 +74,8 @@ def build_corporate_actions(actions: pd.DataFrame, ingested_at: datetime=None):
     return schemas.cast_to_schema(frame, schemas.CORPORATE_ACTIONS_SCHEMA)
 
 
-def ingest_market_calendar(market, start, end, lake_root: str=None) -> pd.DataFrame:
-    """Downloads and overwrites `bronze/dim_market_calendar` for `[start, end]`."""
+def ingest_market_calendar(market, start, end, lakehouse: UnityCatalog=None) -> pd.DataFrame:
+    """Downloads and overwrites `lakehouse.bronze.dim_market_calendar` for `[start, end]`."""
 
     calendar = market.get_calendar(start=_to_iso(start), end=_to_iso(end))
 
@@ -78,17 +83,17 @@ def ingest_market_calendar(market, start, end, lake_root: str=None) -> pd.DataFr
         _LOGGER.warning("Calendar request returned no sessions for %s..%s", start, end)
         return calendar
 
+    lakehouse = lakehouse or get_catalog()
     table = build_market_calendar(calendar)
-    path = lake.get_table_path(schemas.BRONZE_LAYER, schemas.MARKET_CALENDAR_TABLE, lake_root)
-    lake.write_table(table, path)
+    location = lakehouse.write_table(table, schemas.BRONZE_LAYER, schemas.MARKET_CALENDAR_TABLE)
 
-    _LOGGER.info("Wrote %s trading sessions to %s", table.num_rows, path)
+    _LOGGER.info("Wrote %s trading sessions to %s", table.num_rows, location)
 
-    return schemas.to_pandas(table)
+    return _to_calendar_frame(table)
 
 
-def ingest_corporate_actions(market, symbols: str, start, end, lake_root: str=None) -> pd.DataFrame:
-    """Downloads and overwrites `bronze/dim_corporate_actions` for `[start, end]`.
+def ingest_corporate_actions(market, symbols: str, start, end, lakehouse: UnityCatalog=None) -> pd.DataFrame:
+    """Downloads and overwrites `lakehouse.bronze.dim_corporate_actions` for `[start, end]`.
 
     The range is walked in yearly windows because the endpoint limits how wide a single
     request may be.
@@ -113,25 +118,30 @@ def ingest_corporate_actions(market, symbols: str, start, end, lake_root: str=No
         subset=["symbol", "ex_date", "type"], ignore_index=True
     )
 
+    lakehouse = lakehouse or get_catalog()
     table = build_corporate_actions(actions)
-    path = lake.get_table_path(schemas.BRONZE_LAYER, schemas.CORPORATE_ACTIONS_TABLE, lake_root)
-    lake.write_table(table, path)
+    location = lakehouse.write_table(table, schemas.BRONZE_LAYER, schemas.CORPORATE_ACTIONS_TABLE)
 
-    _LOGGER.info("Wrote %s corporate actions to %s", table.num_rows, path)
+    _LOGGER.info("Wrote %s corporate actions to %s", table.num_rows, location)
 
     return schemas.to_pandas(table)
 
 
-def read_market_calendar(lake_root: str=None) -> pd.DataFrame:
-    """Reads `bronze/dim_market_calendar` back as a pandas frame."""
+def read_market_calendar(lakehouse: UnityCatalog=None) -> pd.DataFrame:
+    """Reads `lakehouse.bronze.dim_market_calendar` back, with the session bounds as `time`."""
 
-    return _read(schemas.MARKET_CALENDAR_TABLE, schemas.MARKET_CALENDAR_SCHEMA, lake_root)
+    frame = _read(schemas.MARKET_CALENDAR_TABLE, schemas.MARKET_CALENDAR_SCHEMA, lakehouse)
+
+    if frame.empty:
+        return frame
+
+    return _parse_calendar_times(frame)
 
 
-def read_corporate_actions(lake_root: str=None) -> pd.DataFrame:
-    """Reads `bronze/dim_corporate_actions` back as a pandas frame."""
+def read_corporate_actions(lakehouse: UnityCatalog=None) -> pd.DataFrame:
+    """Reads `lakehouse.bronze.dim_corporate_actions` back as a pandas frame."""
 
-    return _read(schemas.CORPORATE_ACTIONS_TABLE, schemas.CORPORATE_ACTIONS_SCHEMA, lake_root)
+    return _read(schemas.CORPORATE_ACTIONS_TABLE, schemas.CORPORATE_ACTIONS_SCHEMA, lakehouse)
 
 
 def parse_et_time(value) -> time:
@@ -143,6 +153,12 @@ def parse_et_time(value) -> time:
     hour, minute = str(value).split(":")[:2]
 
     return time(int(hour), int(minute))
+
+
+def format_et_time(value: time) -> str:
+    """Renders a `datetime.time` as the `'HH:MM'` the contract stores."""
+
+    return parse_et_time(value).strftime(ET_TIME_FORMAT)
 
 
 def _minutes_between(open_et: time, close_et: time) -> int:
@@ -161,14 +177,28 @@ def _iter_year_windows(start: date, end: date):
         cursor = date(cursor.year + 1, 1, 1)
 
 
-def _read(table_name: str, schema, lake_root: str=None) -> pd.DataFrame:
-    path = lake.get_table_path(schemas.BRONZE_LAYER, table_name, lake_root)
-    table = lake.read_table(path)
+def _read(table_name: str, schema, lakehouse: UnityCatalog=None) -> pd.DataFrame:
+    lakehouse = lakehouse or get_catalog()
+    table = lakehouse.read_table(schemas.BRONZE_LAYER, table_name)
 
     if table.num_columns == 0:
         return pd.DataFrame(columns=schema.names)
 
-    return schemas.to_pandas(table)
+    return schemas.to_pandas(schemas.align_to_schema(table, schema))
+
+
+def _to_calendar_frame(table) -> pd.DataFrame:
+    """Hands the calendar back in its compute form, as `read_market_calendar` would."""
+
+    return _parse_calendar_times(schemas.to_pandas(table))
+
+
+def _parse_calendar_times(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    frame["open_et"] = frame["open_et"].map(parse_et_time)
+    frame["close_et"] = frame["close_et"].map(parse_et_time)
+
+    return frame
 
 
 def _to_date(value) -> date:

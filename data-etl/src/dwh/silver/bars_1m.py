@@ -1,4 +1,4 @@
-"""Silver layer: `bronze/fact_bars_raw` → `silver/fact_bars_1m`.
+"""Silver layer: `lakehouse.bronze.fact_bars_raw` → `lakehouse.silver.fact_bars_1m`.
 
 One row per minute of every regular trading session (09:30–15:59 ET, 390 rows on a full
 day, 210 on an early close), produced as the cross product of the market calendar and the
@@ -17,7 +17,7 @@ import pandas as pd
 
 from src.dwh import schemas
 from src.dwh.bronze.alpaca_bars import to_utc_timestamp
-from src.storage import lake
+from src.storage.catalog import UnityCatalog, get_catalog
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -265,10 +265,10 @@ def run_bronze_to_silver(
     symbol: str,
     start=None,
     end=None,
-    lake_root: str=None,
+    lakehouse: UnityCatalog=None,
     is_validated: bool=True,
 ) -> pd.DataFrame:
-    """Reads bronze, builds `silver/fact_bars_1m` for one symbol and writes it partitioned.
+    """Reads bronze, builds `lakehouse.silver.fact_bars_1m` for one symbol and writes it.
 
     Parameters
     ----------
@@ -276,6 +276,9 @@ def run_bronze_to_silver(
         A single symbol; the silver build is per-symbol so a backfill can be parallelised.
     * start, end: date | str
         Session range. Defaults to the range present in bronze.
+    * lakehouse: src.storage.catalog.UnityCatalog
+        Catalog holding both the bronze input and the silver output. Defaults to the one
+        configured in the environment.
     * is_validated: bool=True
         When True (the default, and the contract), any violation raises and nothing is written.
 
@@ -286,9 +289,10 @@ def run_bronze_to_silver(
 
     from src.dwh.bronze import alpaca_bars, alpaca_reference
 
-    bars = alpaca_bars.read_bars_raw(symbol=symbol, lake_root=lake_root)
-    calendar = alpaca_reference.read_market_calendar(lake_root=lake_root)
-    corporate_actions = alpaca_reference.read_corporate_actions(lake_root=lake_root)
+    lakehouse = lakehouse or get_catalog()
+    bars = alpaca_bars.read_bars_raw(symbol=symbol, lakehouse=lakehouse)
+    calendar = alpaca_reference.read_market_calendar(lakehouse=lakehouse)
+    corporate_actions = alpaca_reference.read_corporate_actions(lakehouse=lakehouse)
     corporate_actions = corporate_actions[corporate_actions["symbol"] == symbol]
 
     bars_1m = build_bars_1m(
@@ -307,10 +311,11 @@ def run_bronze_to_silver(
         assert_bars_1m_valid(bars_1m, calendar, corporate_actions)
 
     table = schemas.cast_to_schema(bars_1m, schemas.BARS_1M_SCHEMA)
-    path = lake.get_table_path(schemas.SILVER_LAYER, schemas.BARS_1M_TABLE, lake_root)
-    lake.write_partitions(table, path, schemas.PARTITION_COLUMNS)
+    location = lakehouse.write_partitions(
+        table, schemas.SILVER_LAYER, schemas.BARS_1M_TABLE, schemas.PARTITION_COLUMNS
+    )
 
-    _LOGGER.info("Wrote %s silver rows for %s to %s", table.num_rows, symbol, path)
+    _LOGGER.info("Wrote %s silver rows for %s to %s", table.num_rows, symbol, location)
 
     return bars_1m
 

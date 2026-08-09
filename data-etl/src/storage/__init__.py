@@ -1,3 +1,3 @@
-from src.storage import lake
+from src.storage import catalog
 
-__all__ = ["lake"]
+__all__ = ["catalog"]

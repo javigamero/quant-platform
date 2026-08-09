@@ -6,7 +6,6 @@ import pytest
 
 from src.dwh import schemas
 from src.dwh.bronze import alpaca_bars
-from src.storage import lake
 
 _INGESTED_AT = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
 
@@ -100,20 +99,22 @@ class TestBuildBarsRaw:
 
 class TestIngestBarsRaw:
 
-    def test_writes_one_partition_per_month(self, tmp_path):
+    def test_writes_one_partition_per_month(self, lakehouse):
         market = FakeMarketData()
         alpaca_bars.ingest_bars_raw(
-            market, symbols="AAPL", start="2016-01-01", end="2016-03-31", lake_root=str(tmp_path)
+            market, symbols="AAPL", start="2016-01-01", end="2016-03-31", lakehouse=lakehouse
         )
 
-        path = lake.get_table_path(schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE, str(tmp_path))
-        assert lake.has_partition(path, {"symbol": "AAPL", "year": "2016", "month": "01"})
-        assert lake.has_partition(path, {"symbol": "AAPL", "year": "2016", "month": "03"})
+        for month in ("01", "03"):
+            assert lakehouse.has_partition(
+                schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE,
+                {"symbol": "AAPL", "year": "2016", "month": month},
+            )
 
-    def test_requests_the_fixed_pipeline_parameters(self, tmp_path):
+    def test_requests_the_fixed_pipeline_parameters(self, lakehouse):
         market = FakeMarketData()
         alpaca_bars.ingest_bars_raw(
-            market, symbols="AAPL", start="2016-01-01", end="2016-01-31", lake_root=str(tmp_path)
+            market, symbols="AAPL", start="2016-01-01", end="2016-01-31", lakehouse=lakehouse
         )
 
         call = market.calls[0]
@@ -122,77 +123,78 @@ class TestIngestBarsRaw:
         assert call["adjustment"] == "raw"
         assert call["limit"] == alpaca_bars.PAGE_LIMIT
 
-    def test_request_window_covers_the_whole_month(self, tmp_path):
+    def test_request_window_covers_the_whole_month(self, lakehouse):
         market = FakeMarketData()
         alpaca_bars.ingest_bars_raw(
-            market, symbols="AAPL", start="2016-02-01", end="2016-02-29", lake_root=str(tmp_path)
+            market, symbols="AAPL", start="2016-02-01", end="2016-02-29", lakehouse=lakehouse
         )
 
         call = market.calls[0]
         assert call["start"] == "2016-02-01T00:00:00Z"
         assert call["end"] == "2016-02-29T23:59:59.999Z"
 
-    def test_summary_reports_rows_written_per_month(self, tmp_path):
+    def test_summary_reports_rows_written_per_month(self, lakehouse):
         market = FakeMarketData()
         summary = alpaca_bars.ingest_bars_raw(
-            market, symbols="AAPL", start="2016-01-01", end="2016-02-29", lake_root=str(tmp_path)
+            market, symbols="AAPL", start="2016-01-01", end="2016-02-29", lakehouse=lakehouse
         )
 
         assert summary["row_count"].tolist() == [1, 1]
 
-    def test_rerunning_does_not_duplicate_rows(self, tmp_path):
+    def test_rerunning_does_not_duplicate_rows(self, lakehouse):
         market = FakeMarketData()
         for _ in range(2):
             alpaca_bars.ingest_bars_raw(
-                market, symbols="AAPL", start="2016-01-01", end="2016-01-31", lake_root=str(tmp_path)
+                market, symbols="AAPL", start="2016-01-01", end="2016-01-31", lakehouse=lakehouse
             )
 
-        assert len(alpaca_bars.read_bars_raw(symbol="AAPL", lake_root=str(tmp_path))) == 1
+        assert len(alpaca_bars.read_bars_raw(symbol="AAPL", lakehouse=lakehouse)) == 1
 
-    def test_existing_months_are_skipped_when_not_overwriting(self, tmp_path):
+    def test_existing_months_are_skipped_when_not_overwriting(self, lakehouse):
         market = FakeMarketData()
         alpaca_bars.ingest_bars_raw(
-            market, symbols="AAPL", start="2016-01-01", end="2016-01-31", lake_root=str(tmp_path)
+            market, symbols="AAPL", start="2016-01-01", end="2016-01-31", lakehouse=lakehouse
         )
         summary = alpaca_bars.ingest_bars_raw(
             market, symbols="AAPL", start="2016-01-01", end="2016-01-31",
-            lake_root=str(tmp_path), is_overwrite=False,
+            lakehouse=lakehouse, is_overwrite=False,
         )
 
         assert summary["is_skipped"].tolist() == [True]
         assert len(market.calls) == 1
 
-    def test_empty_response_writes_nothing(self, tmp_path):
+    def test_empty_response_writes_nothing(self, lakehouse):
         market = FakeMarketData({"2016-01": pd.DataFrame(columns=["symbol", "timestamp_at"])})
         summary = alpaca_bars.ingest_bars_raw(
-            market, symbols="AAPL", start="2016-01-01", end="2016-01-31", lake_root=str(tmp_path)
+            market, symbols="AAPL", start="2016-01-01", end="2016-01-31", lakehouse=lakehouse
         )
 
         assert summary["row_count"].tolist() == [0]
-        assert alpaca_bars.read_bars_raw(lake_root=str(tmp_path)).empty
+        assert alpaca_bars.read_bars_raw(lakehouse=lakehouse).empty
 
 
 class TestReadBarsRaw:
 
-    def test_missing_table_returns_an_empty_frame(self, tmp_path):
-        bars = alpaca_bars.read_bars_raw(lake_root=str(tmp_path))
+    def test_missing_table_returns_an_empty_frame(self, lakehouse):
+        bars = alpaca_bars.read_bars_raw(lakehouse=lakehouse)
         assert bars.empty
         assert list(bars.columns) == list(schemas.BARS_RAW_SCHEMA.names)
 
-    def test_decimals_are_widened_to_float(self, tmp_path):
+    def test_decimals_are_widened_to_float(self, lakehouse):
         alpaca_bars.ingest_bars_raw(
-            FakeMarketData(), symbols="AAPL", start="2016-01-01", end="2016-01-31", lake_root=str(tmp_path)
+            FakeMarketData(), symbols="AAPL", start="2016-01-01", end="2016-01-31", lakehouse=lakehouse
         )
-        bars = alpaca_bars.read_bars_raw(symbol="AAPL", lake_root=str(tmp_path))
+        bars = alpaca_bars.read_bars_raw(symbol="AAPL", lakehouse=lakehouse)
 
         assert pd.api.types.is_float_dtype(bars["close"])
 
-    def test_filters_by_symbol(self, tmp_path):
-        path = lake.get_table_path(schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE, str(tmp_path))
+    def test_filters_by_symbol(self, lakehouse):
         for symbol in ("AAPL", "SPY"):
             table = alpaca_bars.build_bars_raw(
                 make_bars(symbol=symbol), feed="sip", adjustment="raw", currency="USD"
             )
-            lake.write_partitions(table, path, schemas.PARTITION_COLUMNS)
+            lakehouse.write_partitions(
+                table, schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE, schemas.PARTITION_COLUMNS
+            )
 
-        assert alpaca_bars.read_bars_raw(symbol="SPY", lake_root=str(tmp_path))["symbol"].tolist() == ["SPY"]
+        assert alpaca_bars.read_bars_raw(symbol="SPY", lakehouse=lakehouse)["symbol"].tolist() == ["SPY"]

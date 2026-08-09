@@ -379,72 +379,75 @@ class TestValidation:
 
 class TestRunBronzeToSilver:
 
-    def _seed_bronze(self, lake_root):
+    def _seed_bronze(self, lakehouse):
         from src.dwh.bronze import alpaca_bars, alpaca_reference
-        from src.storage import lake
 
         bars = make_bars(session_dates=[_FULL_SESSION, _NEXT_SESSION])
         bars["currency"] = "USD"
         table = alpaca_bars.build_bars_raw(bars, feed="sip", adjustment="raw", currency="USD")
-        lake.write_partitions(
-            table,
-            lake.get_table_path(schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE, lake_root),
-            schemas.PARTITION_COLUMNS,
+        lakehouse.write_partitions(
+            table, schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE, schemas.PARTITION_COLUMNS
         )
 
         calendar = make_calendar()
         calendar["settlement_date"] = None
-        lake.write_table(
+        lakehouse.write_table(
             alpaca_reference.build_market_calendar(calendar),
-            lake.get_table_path(schemas.BRONZE_LAYER, schemas.MARKET_CALENDAR_TABLE, lake_root),
+            schemas.BRONZE_LAYER,
+            schemas.MARKET_CALENDAR_TABLE,
         )
 
         actions = pd.DataFrame([
             {"symbol": _SYMBOL, "ex_date": _NEXT_SESSION, "type": "split", "ratio": 4.0, "cash_amount": np.nan}
         ])
-        lake.write_table(
+        lakehouse.write_table(
             alpaca_reference.build_corporate_actions(actions),
-            lake.get_table_path(schemas.BRONZE_LAYER, schemas.CORPORATE_ACTIONS_TABLE, lake_root),
+            schemas.BRONZE_LAYER,
+            schemas.CORPORATE_ACTIONS_TABLE,
         )
 
-    def test_writes_a_validated_silver_table(self, tmp_path):
-        from src.storage import lake
-
-        self._seed_bronze(str(tmp_path))
-        frame = bars_1m.run_bronze_to_silver(_SYMBOL, lake_root=str(tmp_path))
+    def test_writes_a_validated_silver_table(self, lakehouse):
+        self._seed_bronze(lakehouse)
+        frame = bars_1m.run_bronze_to_silver(_SYMBOL, lakehouse=lakehouse)
 
         assert len(frame) == 2 * bars_1m.REGULAR_SESSION_MINUTES
 
-        path = lake.get_table_path(schemas.SILVER_LAYER, schemas.BARS_1M_TABLE, str(tmp_path))
-        assert lake.read_table(path).num_rows == len(frame)
+        written = lakehouse.read_table(schemas.SILVER_LAYER, schemas.BARS_1M_TABLE)
+        assert written.num_rows == len(frame)
 
-    def test_written_table_matches_the_contract_schema(self, tmp_path):
-        from src.storage import lake
+    def test_written_table_matches_the_contract_schema(self, lakehouse):
+        self._seed_bronze(lakehouse)
+        bars_1m.run_bronze_to_silver(_SYMBOL, lakehouse=lakehouse)
 
-        self._seed_bronze(str(tmp_path))
-        bars_1m.run_bronze_to_silver(_SYMBOL, lake_root=str(tmp_path))
-
-        path = lake.get_table_path(schemas.SILVER_LAYER, schemas.BARS_1M_TABLE, str(tmp_path))
-        table = lake.read_table(path)
+        table = lakehouse.read_table(schemas.SILVER_LAYER, schemas.BARS_1M_TABLE)
 
         assert set(table.schema.names) == set(schemas.BARS_1M_SCHEMA.names)
         assert table.schema.field("adj_factor").type == schemas.BARS_1M_SCHEMA.field("adj_factor").type
 
-    def test_rerunning_does_not_duplicate_rows(self, tmp_path):
-        from src.storage import lake
+    def test_the_table_is_registered_in_the_catalog(self, lakehouse):
+        self._seed_bronze(lakehouse)
+        bars_1m.run_bronze_to_silver(_SYMBOL, lakehouse=lakehouse)
 
-        self._seed_bronze(str(tmp_path))
-        bars_1m.run_bronze_to_silver(_SYMBOL, lake_root=str(tmp_path))
-        bars_1m.run_bronze_to_silver(_SYMBOL, lake_root=str(tmp_path))
+        registered = lakehouse.client.get_table("lakehouse.silver.fact_bars_1m")
 
-        path = lake.get_table_path(schemas.SILVER_LAYER, schemas.BARS_1M_TABLE, str(tmp_path))
-        assert lake.read_table(path).num_rows == 2 * bars_1m.REGULAR_SESSION_MINUTES
+        assert registered["data_source_format"] == "DELTA"
+        assert [column["name"] for column in registered["columns"] if "partition_index" in column] == [
+            "symbol", "year", "month"
+        ]
 
-    def test_the_split_survives_the_round_trip(self, tmp_path):
-        self._seed_bronze(str(tmp_path))
-        frame = bars_1m.run_bronze_to_silver(_SYMBOL, lake_root=str(tmp_path))
+    def test_rerunning_does_not_duplicate_rows(self, lakehouse):
+        self._seed_bronze(lakehouse)
+        bars_1m.run_bronze_to_silver(_SYMBOL, lakehouse=lakehouse)
+        bars_1m.run_bronze_to_silver(_SYMBOL, lakehouse=lakehouse)
+
+        written = lakehouse.read_table(schemas.SILVER_LAYER, schemas.BARS_1M_TABLE)
+        assert written.num_rows == 2 * bars_1m.REGULAR_SESSION_MINUTES
+
+    def test_the_split_survives_the_round_trip(self, lakehouse):
+        self._seed_bronze(lakehouse)
+        frame = bars_1m.run_bronze_to_silver(_SYMBOL, lakehouse=lakehouse)
 
         assert frame[frame["session_date"] == _FULL_SESSION]["close_adj"].iloc[0] == pytest.approx(25.0)
 
-    def test_missing_bronze_produces_nothing(self, tmp_path):
-        assert bars_1m.run_bronze_to_silver(_SYMBOL, lake_root=str(tmp_path)).empty
+    def test_missing_bronze_produces_nothing(self, lakehouse):
+        assert bars_1m.run_bronze_to_silver(_SYMBOL, lakehouse=lakehouse).empty

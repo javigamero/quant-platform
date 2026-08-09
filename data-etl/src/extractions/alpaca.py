@@ -349,7 +349,11 @@ class MarketData(Authenticator):
         if not raw_calendar:
             return pd.DataFrame(columns=self._CALENDAR_COLUMNS)
 
-        df = pd.DataFrame(raw_calendar).rename(columns={"date": "session_date"})
+        # The API names the regular-hours bounds `open`/`close`; `session_open`/`session_close`
+        # are the extended-hours ones, which the pipeline does not use.
+        df = pd.DataFrame(raw_calendar).rename(
+            columns={"date": "session_date", "open": "open_et", "close": "close_et"}
+        )
 
         for column in self._CALENDAR_COLUMNS:
             if column not in df.columns:

@@ -1,15 +1,18 @@
 # data-etl
 
-PySpark + Jupyter ETL pipelines for ingesting financial market data into a medallion lakehouse architecture backed by MinIO (Delta Lake) and TimescaleDB.
+ETL pipelines for ingesting financial market data into a medallion lakehouse: Delta Lake
+tables governed by Unity Catalog, plus TimescaleDB for serving.
 
 ## Overview
 
-Pipelines follow a **medallion architecture**:
+Pipelines follow a **medallion architecture**. Every table is an **external Delta table
+registered in Unity Catalog**, so the same table is readable from pandas, from Spark
+(`spark.table("lakehouse.bronze.fact_bars_raw")`) and from the Unity Catalog UI:
 
 | Layer | Prefix | Description | Storage |
 |---|---|---|---|
-| Bronze | `i_` | Raw ingestion from external APIs | `$LAKE_ROOT/bronze/...` (Parquet + Snappy) |
-| Silver | `ii_` | Calendar alignment, adjustment, validation | `$LAKE_ROOT/silver/...` (Parquet + Snappy) |
+| Bronze | `i_` | Raw ingestion from external APIs | `lakehouse.bronze.*` (Delta) |
+| Silver | `ii_` | Calendar alignment, adjustment, validation | `lakehouse.silver.*` (Delta) |
 | Gold | `iii_` | Feature engineering, model-ready outputs | _(planned)_ |
 
 ## Directory layout
@@ -21,7 +24,7 @@ data-etl/
 ├── docs/                       # Data lineage and schema documentation
 ├── src/                        # Reusable Python modules
 │   ├── extractions/            # API clients (Alpaca, Alpha Vantage)
-│   ├── storage/                # Parquet data lake helpers
+│   ├── storage/                # Unity Catalog registration + Delta reads/writes
 │   └── dwh/                    # Layer jobs
 │       ├── schemas.py          # Versioned Arrow contracts
 │       ├── bronze/             # origin → bronze
@@ -50,7 +53,8 @@ docker compose start        # subsequent starts
 
 Services after startup:
 - Jupyter / Spark: http://localhost:8888
-- MinIO Console: http://localhost:9001
+- Unity Catalog API: http://localhost:8081 · UI: http://localhost:3000
+- Airflow: http://localhost:8080
 - TimescaleDB: `localhost:5432`
 
 ## Data sources
@@ -78,19 +82,19 @@ market.get_calendar(start="2016-01-01", end="2016-12-31")
 market.get_corporate_actions(symbol="AAPL", start="2020-01-01", end="2020-12-31")
 ```
 
-## AAPL 1-minute pipeline
+## Market values 1-minute pipeline
 
 Ingests every field Alpaca exposes for 1-minute bars and turns it into a gap-free,
 adjusted, validated minute series. The field-level contract is
 [`configs/data_contracts/alpaca_bars.md`](configs/data_contracts/alpaca_bars.md); the
 authoritative schemas live in `src/dwh/schemas.py`.
 
-| Layer | Table | Job |
-|---|---|---|
-| bronze | `fact_bars_raw` | `src.dwh.bronze.alpaca_bars.ingest_bars_raw` |
-| bronze | `dim_market_calendar` | `src.dwh.bronze.alpaca_reference.ingest_market_calendar` |
-| bronze | `dim_corporate_actions` | `src.dwh.bronze.alpaca_reference.ingest_corporate_actions` |
-| silver | `fact_bars_1m` | `src.dwh.silver.bars_1m.run_bronze_to_silver` |
+| Unity Catalog table | Job |
+|---|---|
+| `lakehouse.bronze.fact_bars_raw` | `src.dwh.bronze.alpaca_bars.ingest_bars_raw` |
+| `lakehouse.bronze.dim_market_calendar` | `src.dwh.bronze.alpaca_reference.ingest_market_calendar` |
+| `lakehouse.bronze.dim_corporate_actions` | `src.dwh.bronze.alpaca_reference.ingest_corporate_actions` |
+| `lakehouse.silver.fact_bars_1m` | `src.dwh.silver.bars_1m.run_bronze_to_silver` |
 
 ```python
 from src.dwh.bronze import alpaca_bars, alpaca_reference
@@ -102,22 +106,30 @@ alpaca_bars.ingest_bars_raw(market, symbols="AAPL", start="2016-01-01", end="202
 bars_1m.run_bronze_to_silver("AAPL")
 ```
 
+Every job takes an optional `lakehouse=` handle (`src.storage.catalog.get_catalog()`);
+without one it builds the default from the environment.
+
 All jobs are idempotent and parameterised by `(symbol, date_range)`: a partition is
-rewritten whole rather than appended to, so a retry after a partial failure cannot
-duplicate rows. Bronze always stores `adjustment=raw` — Alpaca applies adjustments with
-the factors known *today*, so only raw data plus a versioned corporate actions table makes
-the adjusted series reproducible.
+replaced whole in a single Delta commit rather than appended to, so a retry after a
+partial failure cannot duplicate rows. Bronze always stores `adjustment=raw` — Alpaca
+applies adjustments with the factors known *today*, so only raw data plus a versioned
+corporate actions table makes the adjusted series reproducible.
 
-The lake root comes from `LAKE_ROOT` (default `/data/lake`), the volume mounted by
-`quant-infrastructure`.
+Nothing outside `src/storage/catalog.py` builds a path: the job asks Unity Catalog where a
+table lives, which is what keeps pandas, Spark and the catalog UI looking at one dataset.
 
-For notebooks that do not depend on Spark, extractions can be run using the local virtual environment in `env/`:
+For extractions that do not depend on Spark, the pipeline runs in the local virtual
+environment in `env/`:
 
 ```sh
 source data-etl/env/bin/activate
 ```
 
-Local dependencies are pinned in `configs/local_requirements.txt` (pandas, pyarrow, polars, requests, python-dotenv, …).
+Local dependencies are pinned in `configs/local_requirements.txt` (pandas, pyarrow,
+deltalake, polars, requests, python-dotenv, …). Point `UNITY_CATALOG_URI` at
+`http://localhost:8081` and `LAKEHOUSE_ROOT` at a path you can write when running outside
+the container — the location registered in the catalog must be reachable by every engine
+that later reads the table.
 
 ## Tests
 
@@ -126,9 +138,10 @@ pytest data-etl/tests/unit          # no network, no credentials
 pytest data-etl/tests/integration   # live Alpaca calls, needs credentials
 ```
 
-Unit tests cover the extraction parsers, the layer jobs and the lake writer end to end
-against a temporary lake root. Tests that hit the API skip themselves when
-`APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` are unset.
+Unit tests cover the extraction parsers, the layer jobs and the catalog writer end to end:
+the Delta round trip is real, against a temporary warehouse root, and only the Unity
+Catalog server is faked (`tests/unit/fakes.py`), so no service is needed. Tests that hit
+the API skip themselves when `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` are unset.
 
 ## Running notebooks
 
@@ -138,33 +151,53 @@ Open Jupyter at http://localhost:8888. Notebooks are mounted from this repo into
 
 | Notebook | What it checks |
 |---|---|
-| `tests/infra/spark_catalog.ipynb` | Spark ↔ Delta Lake ↔ MinIO |
+| `tests/infra/spark_catalog.ipynb` | Spark ↔ Delta Lake ↔ storage |
 | `tests/infra/spark_postgresql.ipynb` | Spark ↔ PostgreSQL JDBC |
 
 **Pipeline notebooks:**
 
 | Notebook | Source | Description |
 |---|---|---|
-| `scripts/dwh/i_origin_to_bronze/alpaca/extract_aapl_1min_bars.ipynb` | Alpaca | AAPL 1-minute bars, calendar and corporate actions → bronze |
-| `scripts/dwh/ii_bronze_to_silver/alpaca/build_bars_1m.ipynb` | — | bronze → silver `fact_bars_1m`, gap-filled, adjusted, validated |
-| `scripts/dwh/i_origin_to_bronze/extract_intraday_series.ipynb` | Alpha Vantage | Intraday OHLCV bars → MinIO bronze |
+| `scripts/dwh/i_origin_to_bronze/alpaca/extract_aapl_1min_bars.ipynb` | Alpaca | AAPL 1-minute bars, calendar and corporate actions → `lakehouse.bronze.*` |
+| `scripts/dwh/ii_bronze_to_silver/alpaca/build_bars_1m.ipynb` | — | bronze → `lakehouse.silver.fact_bars_1m`, gap-filled, adjusted, validated |
+| `scripts/dwh/i_origin_to_bronze/extract_intraday_series.ipynb` | Alpha Vantage | Raw intraday request — exploratory, does not land in the catalog yet |
 
-## SparkSession pattern
+## Reading the tables from Spark
 
-All notebooks that write to MinIO must configure S3A and Delta Lake:
+The jobs write with `deltalake`; Spark reads the same tables through the Unity Catalog
+connector. Both `spark_catalog` and `lakehouse` must use `UCSingleCatalog`, or table
+resolution silently falls back to Spark's session catalog:
 
 ```python
-# TODO
+spark = (
+    SparkSession.builder
+    .appName("silver-bars-1m")
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .config("spark.sql.catalog.spark_catalog", "io.unitycatalog.spark.UCSingleCatalog")
+    .config("spark.sql.catalog.spark_catalog.uri", os.environ["UNITY_CATALOG_URI"])
+    .config("spark.sql.catalog.spark_catalog.token", "")
+    .config("spark.sql.catalog.lakehouse", "io.unitycatalog.spark.UCSingleCatalog")
+    .config("spark.sql.catalog.lakehouse.uri", os.environ["UNITY_CATALOG_URI"])
+    .config("spark.sql.catalog.lakehouse.token", "")
+    .getOrCreate()
+)
+
+spark.table("lakehouse.silver.fact_bars_1m").where("symbol = 'AAPL'").show()
 ```
 
-Credentials are always injected via environment variables — never hardcoded.
+The OSS connector supports **external** Delta tables only — which is what these jobs
+register. Credentials are always injected via environment variables, never hardcoded.
 
 ## Key JVM dependencies
 
-TODO
+Passed via `PYSPARK_SUBMIT_ARGS` in `quant-infrastructure/docker-compose.yml`; no separate
+install step. Only Spark readers need them — the ingestion jobs do not.
 
 | Artifact | Version | Purpose |
 |---|---|---|
+| `io.delta:delta-spark_2.12` | 3.2.1 | Delta Lake (requires Spark 3.5.3) |
+| `io.unitycatalog:unitycatalog-spark_2.12` | 0.2.0 | Unity Catalog Spark connector |
+| `org.postgresql:postgresql` | 42.7.3 | JDBC driver for TimescaleDB |
 
 ## Naming conventions
 

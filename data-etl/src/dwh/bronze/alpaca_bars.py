@@ -1,4 +1,4 @@
-"""Bronze ingestion: Alpaca 1-minute bars → `bronze/fact_bars_raw`.
+"""Bronze ingestion: Alpaca 1-minute bars → `lakehouse.bronze.fact_bars_raw`.
 
 Append-only, untransformed copy of `GET /v2/stocks/bars`. Keeping the raw response is
 what makes the rest of the pipeline replayable: a bug in a feature definition must never
@@ -14,10 +14,9 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
-import pyarrow.dataset as pa_ds
 
 from src.dwh import schemas
-from src.storage import lake
+from src.storage.catalog import UnityCatalog, get_catalog
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -104,10 +103,10 @@ def ingest_bars_raw(
     feed: str=DEFAULT_FEED,
     adjustment: str=DEFAULT_ADJUSTMENT,
     currency: str=DEFAULT_CURRENCY,
-    lake_root: str=None,
+    lakehouse: UnityCatalog=None,
     is_overwrite: bool=True,
 ) -> pd.DataFrame:
-    """Backfills `bronze/fact_bars_raw` month by month over `[start, end]`.
+    """Backfills `lakehouse.bronze.fact_bars_raw` month by month over `[start, end]`.
 
     Parameters
     ----------
@@ -117,8 +116,10 @@ def ingest_bars_raw(
         SPY and QQQ later (needed for the market-context features) costs nothing.
     * start, end: date | str
         Inclusive bounds, `YYYY-MM-DD`.
+    * lakehouse: src.storage.catalog.UnityCatalog
+        Target catalog. Defaults to the one configured in the environment.
     * is_overwrite: bool=True
-        When False, months that already have data on disk are skipped, so an interrupted
+        When False, months already committed to the table are skipped, so an interrupted
         backfill can be resumed without re-hitting the API.
 
     Returns
@@ -128,14 +129,18 @@ def ingest_bars_raw(
 
     start = _to_date(start)
     end = _to_date(end)
-    path = lake.get_table_path(schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE, lake_root)
+    lakehouse = lakehouse or get_catalog()
     symbol_list = [symbol.strip() for symbol in symbols.split(",") if symbol.strip()]
 
     summary = []
 
     for year, month, window_start, window_end in iter_month_windows(start, end):
         is_present = all(
-            lake.has_partition(path, {"symbol": symbol, "year": year, "month": month})
+            lakehouse.has_partition(
+                schemas.BRONZE_LAYER,
+                schemas.BARS_RAW_TABLE,
+                {"symbol": symbol, "year": year, "month": month},
+            )
             for symbol in symbol_list
         )
 
@@ -161,7 +166,9 @@ def ingest_bars_raw(
             continue
 
         table = build_bars_raw(bars, feed=feed, adjustment=adjustment, currency=currency)
-        lake.write_partitions(table, path, schemas.PARTITION_COLUMNS)
+        lakehouse.write_partitions(
+            table, schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE, schemas.PARTITION_COLUMNS
+        )
 
         _LOGGER.info("Wrote %s bars for %s-%s", table.num_rows, year, month)
         summary.append({"year": year, "month": month, "row_count": table.num_rows, "is_skipped": False})
@@ -169,17 +176,21 @@ def ingest_bars_raw(
     return pd.DataFrame(summary, columns=["year", "month", "row_count", "is_skipped"])
 
 
-def read_bars_raw(symbol: str=None, lake_root: str=None) -> pd.DataFrame:
-    """Reads `bronze/fact_bars_raw` back as a pandas frame, optionally for one symbol."""
+def read_bars_raw(symbol: str=None, lakehouse: UnityCatalog=None) -> pd.DataFrame:
+    """Reads `lakehouse.bronze.fact_bars_raw` back as a pandas frame, optionally for one symbol.
 
-    path = lake.get_table_path(schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE, lake_root)
-    filters = None if symbol is None else pa_ds.field("symbol") == symbol
-    table = lake.read_table(path, filters=filters)
+    `symbol` is a partition column, so the filter prunes directories instead of reading
+    ten years of every other symbol and discarding it.
+    """
+
+    lakehouse = lakehouse or get_catalog()
+    filters = None if symbol is None else [("symbol", "=", symbol)]
+    table = lakehouse.read_table(schemas.BRONZE_LAYER, schemas.BARS_RAW_TABLE, filters=filters)
 
     if table.num_columns == 0:
         return pd.DataFrame(columns=schemas.BARS_RAW_SCHEMA.names)
 
-    return schemas.to_pandas(table)
+    return schemas.to_pandas(schemas.align_to_schema(table, schemas.BARS_RAW_SCHEMA))
 
 
 def _to_date(value) -> date:

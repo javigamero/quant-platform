@@ -1,7 +1,7 @@
 """Canonical Arrow schemas for the Alpaca 1-minute bar pipeline.
 
 These schemas are the versioned contract between layers: a breaking change means
-bumping `SCHEMA_VERSION` and writing to a new path, never mutating the existing one.
+bumping `SCHEMA_VERSION` and writing to a new table, never mutating the existing one.
 
 Design notes (see `configs/data_contracts/alpaca_bars.md`):
 * Prices are `decimal(18,6)`, not `float`: accumulating log-returns over ~1M bars
@@ -10,12 +10,18 @@ Design notes (see `configs/data_contracts/alpaca_bars.md`):
   where the market calendar (DST, 09:30 ET open) makes local time meaningful.
 * Table names follow the repo's Kimball convention; the design document calls them
   `bars_raw`, `bars_1m`, `market_calendar` and `corporate_actions`.
+
+The types here are the ones Delta can store, since every table is an external Delta
+table in Unity Catalog. Delta has no TIME type, so the calendar's session bounds are
+`'HH:MM'` strings on disk and `datetime.time` in memory — the same storage/compute split
+decimals get from `to_pandas`.
 """
 
 import pyarrow as pa
 
 SCHEMA_VERSION = "v1"
 
+# The layer names double as the Unity Catalog schemas of the `lakehouse` catalog.
 BRONZE_LAYER = "bronze"
 SILVER_LAYER = "silver"
 
@@ -30,6 +36,7 @@ _PRICE = pa.decimal128(18, 6)
 _FACTOR = pa.decimal128(18, 10)
 _TIMESTAMP_UTC = pa.timestamp("us", tz="UTC")
 _TIMESTAMP_ET = pa.timestamp("us", tz="America/New_York")
+_ET_TIME = pa.string()
 
 PRICE_SCALE = 6
 FACTOR_SCALE = 10
@@ -56,8 +63,8 @@ BARS_RAW_SCHEMA = pa.schema([
 # bronze/dim_market_calendar — one row per trading session.
 MARKET_CALENDAR_SCHEMA = pa.schema([
     pa.field("session_date", pa.date32(), nullable=False),
-    pa.field("open_et", pa.time32("s"), nullable=False),
-    pa.field("close_et", pa.time32("s"), nullable=False),
+    pa.field("open_et", _ET_TIME, nullable=False),
+    pa.field("close_et", _ET_TIME, nullable=False),
     pa.field("session_minutes", pa.int16(), nullable=False),
     pa.field("is_half_day", pa.bool_(), nullable=False),
     pa.field("settlement_date", pa.date32()),
@@ -127,8 +134,20 @@ def cast_to_schema(df, schema: pa.Schema) -> pa.Table:
     return table.cast(schema)
 
 
+def align_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Restores the contract on a table read back from the catalog.
+
+    Delta hands columns back in its own order and normalises every timestamp to UTC, so
+    a regional column (`timestamp_et_at`) comes back as an instant. Casting to the schema
+    puts the columns back in contract order and re-attaches the zone the contract names —
+    the instant does not move, only how it reads.
+    """
+
+    return table.select(list(schema.names)).cast(schema)
+
+
 def to_pandas(table: pa.Table):
-    """Converts a lake table to pandas, widening decimals to `float64`.
+    """Converts a catalog table to pandas, widening decimals to `float64`.
 
     Arrow hands `decimal128` back as Python `Decimal` objects, which silently break every
     arithmetic operation downstream. Decimal is the storage contract; float is the compute type.

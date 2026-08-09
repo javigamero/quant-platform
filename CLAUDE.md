@@ -11,10 +11,11 @@ All code runs inside the Spark/Jupyter container managed by the sibling `quant-i
 All development happens through Jupyter at `http://localhost:8888`. Notebooks are mounted from this repo into the container at `/home/jovyan/work`.
 
 **Infrastructure smoke tests** (run these first when setting up or debugging connectivity):
-- `data-etl/tests/infra/spark_catalog.ipynb` — validates Spark ↔ Delta Lake ↔ MinIO
+- `data-etl/tests/infra/spark_catalog.ipynb` — validates Spark ↔ Delta Lake ↔ storage
 - `data-etl/tests/infra/spark_postgresql.ipynb` — validates Spark ↔ PostgreSQL JDBC
 
-There is currently no `pytest` setup or CI. Tests are notebook-based; run them cell-by-cell in Jupyter.
+The ETL library is covered by `pytest` (`data-etl/tests/unit`, run on CI); the infra
+notebooks above stay notebook-based, run cell-by-cell in Jupyter.
 
 ## ETL scripts layout
 
@@ -22,7 +23,7 @@ Scripts are organized under `data-etl/scripts/dwh/` by DWH layer using a naming 
 
 | Prefix | Layer | Description |
 |---|---|---|
-| `i_` | origin → bronze | Raw ingestion from external APIs to the Parquet lake |
+| `i_` | origin → bronze | Raw ingestion from external APIs into `lakehouse.bronze.*` (Delta, Unity Catalog) |
 | `ii_` | bronze → silver | Calendar alignment, adjustment, validation |
 | `iii_` | silver → gold | Feature engineering, model-ready outputs _(planned)_ |
 

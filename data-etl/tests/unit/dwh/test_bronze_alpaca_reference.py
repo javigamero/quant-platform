@@ -49,6 +49,15 @@ class TestParseEtTime:
         assert alpaca_reference.parse_et_time(time(16, 0)) == time(16, 0)
 
 
+class TestFormatEtTime:
+
+    def test_renders_the_stored_format(self):
+        assert alpaca_reference.format_et_time(time(9, 30)) == "09:30"
+
+    def test_a_string_round_trips(self):
+        assert alpaca_reference.format_et_time("13:00:00") == "13:00"
+
+
 class TestBuildMarketCalendar:
 
     @pytest.fixture
@@ -72,8 +81,9 @@ class TestBuildMarketCalendar:
     def test_regular_sessions_are_not_flagged(self, table):
         assert _row_for(table, date(2016, 1, 4))["is_half_day"] is False
 
-    def test_times_are_stored_as_time_of_day(self, table):
-        assert _row_for(table, date(2016, 1, 4))["open_et"] == time(9, 30)
+    def test_times_are_stored_as_hh_mm_strings(self, table):
+        # Delta has no TIME type; the compute form is restored by read_market_calendar.
+        assert _row_for(table, date(2016, 1, 4))["open_et"] == "09:30"
 
     def test_missing_settlement_dates_are_tolerated(self):
         calendar = _CALENDAR.drop(columns=["settlement_date"]).assign(settlement_date=None)
@@ -105,43 +115,60 @@ class TestBuildCorporateActions:
 
 class TestIngestMarketCalendar:
 
-    def test_writes_and_reads_back_the_calendar(self, tmp_path):
+    def test_writes_and_reads_back_the_calendar(self, lakehouse):
         alpaca_reference.ingest_market_calendar(
-            FakeMarketData(), start="2015-11-01", end="2016-01-31", lake_root=str(tmp_path)
+            FakeMarketData(), start="2015-11-01", end="2016-01-31", lakehouse=lakehouse
         )
-        calendar = alpaca_reference.read_market_calendar(lake_root=str(tmp_path))
+        calendar = alpaca_reference.read_market_calendar(lakehouse=lakehouse)
 
         assert len(calendar) == 2
 
-    def test_rerunning_replaces_instead_of_appending(self, tmp_path):
+    def test_session_bounds_are_read_back_as_times(self, lakehouse):
+        alpaca_reference.ingest_market_calendar(
+            FakeMarketData(), start="2015-11-01", end="2016-01-31", lakehouse=lakehouse
+        )
+        calendar = alpaca_reference.read_market_calendar(lakehouse=lakehouse)
+
+        assert set(calendar["open_et"]) == {time(9, 30)}
+
+    def test_the_table_is_registered_in_the_catalog(self, lakehouse):
+        alpaca_reference.ingest_market_calendar(
+            FakeMarketData(), start="2015-11-01", end="2016-01-31", lakehouse=lakehouse
+        )
+        registered = lakehouse.client.get_table("lakehouse.bronze.dim_market_calendar")
+
+        assert registered["table_type"] == "EXTERNAL"
+        assert registered["storage_location"].endswith("/bronze/dim_market_calendar")
+
+    def test_rerunning_replaces_instead_of_appending(self, lakehouse):
         market = FakeMarketData()
         for _ in range(2):
             alpaca_reference.ingest_market_calendar(
-                market, start="2015-11-01", end="2016-01-31", lake_root=str(tmp_path)
+                market, start="2015-11-01", end="2016-01-31", lakehouse=lakehouse
             )
 
-        assert len(alpaca_reference.read_market_calendar(lake_root=str(tmp_path))) == 2
+        assert len(alpaca_reference.read_market_calendar(lakehouse=lakehouse)) == 2
 
-    def test_dates_are_passed_to_the_api_as_iso_days(self, tmp_path):
+    def test_dates_are_passed_to_the_api_as_iso_days(self, lakehouse):
         market = FakeMarketData()
         alpaca_reference.ingest_market_calendar(
-            market, start=date(2015, 11, 1), end="2016-01-31", lake_root=str(tmp_path)
+            market, start=date(2015, 11, 1), end="2016-01-31", lakehouse=lakehouse
         )
 
         assert market.calendar_calls == [("2015-11-01", "2016-01-31")]
 
-    def test_missing_table_reads_back_empty(self, tmp_path):
-        calendar = alpaca_reference.read_market_calendar(lake_root=str(tmp_path))
+    def test_missing_table_reads_back_empty(self, lakehouse):
+        calendar = alpaca_reference.read_market_calendar(lakehouse=lakehouse)
         assert calendar.empty
         assert list(calendar.columns) == list(schemas.MARKET_CALENDAR_SCHEMA.names)
 
 
 class TestIngestCorporateActions:
 
-    def test_walks_the_range_in_yearly_windows(self, tmp_path):
+    def test_walks_the_range_in_yearly_windows(self, lakehouse):
         market = FakeMarketData(actions=pd.DataFrame(columns=_ACTIONS.columns))
         alpaca_reference.ingest_corporate_actions(
-            market, symbols="AAPL", start="2016-06-01", end="2018-03-01", lake_root=str(tmp_path)
+            market, symbols="AAPL", start="2016-06-01", end="2018-03-01", lakehouse=lakehouse
         )
 
         assert [call[1:] for call in market.action_calls] == [
@@ -150,28 +177,28 @@ class TestIngestCorporateActions:
             ("2018-01-01", "2018-03-01"),
         ]
 
-    def test_repeated_actions_across_windows_are_deduplicated(self, tmp_path):
+    def test_repeated_actions_across_windows_are_deduplicated(self, lakehouse):
         market = FakeMarketData()
         alpaca_reference.ingest_corporate_actions(
-            market, symbols="AAPL", start="2016-01-01", end="2018-01-01", lake_root=str(tmp_path)
+            market, symbols="AAPL", start="2016-01-01", end="2018-01-01", lakehouse=lakehouse
         )
 
-        assert len(alpaca_reference.read_corporate_actions(lake_root=str(tmp_path))) == 2
+        assert len(alpaca_reference.read_corporate_actions(lakehouse=lakehouse)) == 2
 
-    def test_no_actions_writes_nothing(self, tmp_path):
+    def test_no_actions_writes_nothing(self, lakehouse):
         market = FakeMarketData(actions=pd.DataFrame(columns=_ACTIONS.columns))
         actions = alpaca_reference.ingest_corporate_actions(
-            market, symbols="AAPL", start="2016-01-01", end="2016-12-31", lake_root=str(tmp_path)
+            market, symbols="AAPL", start="2016-01-01", end="2016-12-31", lakehouse=lakehouse
         )
 
         assert actions.empty
-        assert alpaca_reference.read_corporate_actions(lake_root=str(tmp_path)).empty
+        assert alpaca_reference.read_corporate_actions(lakehouse=lakehouse).empty
 
-    def test_decimals_are_widened_to_float_on_read(self, tmp_path):
+    def test_decimals_are_widened_to_float_on_read(self, lakehouse):
         alpaca_reference.ingest_corporate_actions(
-            FakeMarketData(), symbols="AAPL", start="2020-01-01", end="2020-12-31", lake_root=str(tmp_path)
+            FakeMarketData(), symbols="AAPL", start="2020-01-01", end="2020-12-31", lakehouse=lakehouse
         )
-        actions = alpaca_reference.read_corporate_actions(lake_root=str(tmp_path))
+        actions = alpaca_reference.read_corporate_actions(lakehouse=lakehouse)
 
         assert pd.api.types.is_float_dtype(actions["ratio"])
 

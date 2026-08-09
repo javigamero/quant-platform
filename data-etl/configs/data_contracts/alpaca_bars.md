@@ -2,17 +2,18 @@
 
 Field-level contract for the AAPL 1-minute pipeline. The authoritative definition is
 `src/dwh/schemas.py`; this file is its readable form. A breaking change means bumping
-`SCHEMA_VERSION` and writing to a **new path** — never mutating an existing one.
+`SCHEMA_VERSION` and writing to a **new table** — never mutating an existing one.
 
-Table names follow the repo's Kimball convention. The design document refers to them
-without the prefix:
+Every table is an external Delta table registered in Unity Catalog, so the layer is part
+of the name. Table names follow the repo's Kimball convention; the design document refers
+to them without the prefix:
 
-| Design document | This repo | Layer |
+| Design document | This repo | Unity Catalog |
 |---|---|---|
-| `bars_raw` | `fact_bars_raw` | bronze |
-| `market_calendar` | `dim_market_calendar` | bronze |
-| `corporate_actions` | `dim_corporate_actions` | bronze |
-| `bars_1m` | `fact_bars_1m` | silver |
+| `bars_raw` | `fact_bars_raw` | `lakehouse.bronze.fact_bars_raw` |
+| `market_calendar` | `dim_market_calendar` | `lakehouse.bronze.dim_market_calendar` |
+| `corporate_actions` | `dim_corporate_actions` | `lakehouse.bronze.dim_corporate_actions` |
+| `bars_1m` | `fact_bars_1m` | `lakehouse.silver.fact_bars_1m` |
 
 ## Fixed decisions
 
@@ -21,7 +22,7 @@ without the prefix:
 | Source | Alpaca Market Data v2, `feed=sip` | 100% of the volume; on the Basic plan for data older than 15 minutes. |
 | Granularity | `1Min` | ~1M rows for AAPL 2016→2026; re-aggregable to 5m/15m/1h/1d without touching the API. |
 | Adjustment | `raw` in bronze, applied in silver | Alpaca adjusts with the factors known *today*, so an adjusted re-extraction after a new split returns different prices for the same dates. |
-| Format | Parquet + Snappy | Columnar, compresses numeric series well, read natively by Spark and pandas. |
+| Format | Delta Lake (Parquet + Snappy files), external table in Unity Catalog | The transaction log makes a partition replacement atomic, so a retried write cannot duplicate rows; the catalog makes the same table readable from pandas, Spark and the UC UI. |
 | Timezone | UTC in storage, `America/New_York` in silver | The market calendar (DST, 09:30 ET open) only makes sense in local time. |
 | Price type | `decimal(18,6)` | Accumulating log-returns over ~1M bars amplifies binary float rounding. Decimal is the storage type; `schemas.to_pandas` widens to `float64` for compute. |
 
@@ -46,7 +47,7 @@ plus request provenance.
 
 * **Partitioning:** `symbol=AAPL/year=2024/month=03/` — keeps files at ~5–20 MB and allows selective backfills.
 * **Logical key:** `(symbol, timestamp_at, feed)`.
-* **Idempotency:** a partition is rewritten whole, never appended to, so a retry after a partial failure cannot duplicate rows.
+* **Idempotency:** a partition is replaced whole in a single Delta commit (`replaceWhere` over the partitions present in the batch), never appended to, so a retry after a partial failure cannot duplicate rows and a reader never sees half a partition.
 * **Pagination:** `limit=10000` + `next_page_token`, one request window per month.
 
 ## bronze / `dim_market_calendar`
@@ -56,7 +57,7 @@ From `GET /v2/calendar` (Trading API).
 | Column | Type | Notes |
 |---|---|---|
 | `session_date` | `date32` | |
-| `open_et`, `close_et` | `time32[s]` | Early closes at 13:00 ET (Thanksgiving eve, 24 Dec) are real and frequent. |
+| `open_et`, `close_et` | `string` (`'HH:MM'`) | Early closes at 13:00 ET (Thanksgiving eve, 24 Dec) are real and frequent. Delta has no TIME type, so the string is the storage form; `read_market_calendar` parses it back to `datetime.time` for compute. |
 | `session_minutes` | `int16` | 390 on a full session, 210 on an early close. |
 | `is_half_day` | `bool` | `close_et < 16:00`. |
 | `settlement_date` | `date32` | As returned by the API. |
@@ -90,7 +91,7 @@ Adds to the bronze columns:
 
 | Column | Type | Definition |
 |---|---|---|
-| `timestamp_et_at` | `timestamp[us, America/New_York]` | `timestamp_at` in market time. |
+| `timestamp_et_at` | `timestamp[us, America/New_York]` | `timestamp_at` in market time. Delta stores one timestamp type — a UTC instant — so the zone is a read-side view: `schemas.align_to_schema` re-attaches it, and Spark shows it in the session timezone. |
 | `session_date` | `date32` | Session, not the timestamp's date (they differ pre/post-market). |
 | `minute_index` | `int16` | 0–389, position within the session. |
 | `adj_factor` | `decimal(18,10)` | Cumulative product of the factors of every action with `ex_date` **after** this session. |
