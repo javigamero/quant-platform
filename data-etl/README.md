@@ -154,34 +154,17 @@ Open Jupyter at http://localhost:8888. Notebooks are mounted from this repo into
 All notebooks that write to MinIO must configure S3A and Delta Lake:
 
 ```python
-from pyspark.sql import SparkSession
-import os
-
-spark = (
-    SparkSession.builder
-    .appName("my-pipeline")
-    .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
-    .config("spark.hadoop.fs.s3a.access.key", os.getenv("MINIO_ROOT_USER"))
-    .config("spark.hadoop.fs.s3a.secret.key", os.getenv("MINIO_ROOT_PASSWORD"))
-    .config("spark.hadoop.fs.s3a.path.style.access", "true")
-    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-    .getOrCreate()
-)
+# TODO
 ```
 
 Credentials are always injected via environment variables — never hardcoded.
 
 ## Key JVM dependencies
 
-Injected automatically via `PYSPARK_SUBMIT_ARGS` in `docker-compose.yml` — no manual install needed.
+TODO
 
 | Artifact | Version | Purpose |
 |---|---|---|
-| `io.delta:delta-core_2.12` | 2.4.0 | Delta Lake |
-| `org.apache.hadoop:hadoop-aws` | 3.3.2 | S3A connector for MinIO |
-| `org.postgresql:postgresql` | 42.7.3 | JDBC driver for TimescaleDB |
 
 ## Naming conventions
 
