@@ -1,8 +1,10 @@
 import os
+import time
 from datetime import timezone
 
 import pandas as pd
 import pytest
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,7 +16,9 @@ _CREDENTIALS = {
     "APCA-API-SECRET-KEY": os.getenv("APCA-API-SECRET-KEY"),
 }
 
-_EXPECTED_COLUMNS = ["timestamp_at", "open", "high", "low", "close", "volume", "trade_count", "vwap"]
+_EXPECTED_COLUMNS = [
+    "symbol", "timestamp_at", "open", "high", "low", "close", "volume", "trade_count", "vwap"
+]
 
 _RAW_BAR = {
     "t": "2025-01-02T14:00:00Z",
@@ -26,6 +30,8 @@ _RAW_BAR = {
     "n": 128106,
     "vw": 246.47,
 }
+
+_RAW_BARS = {"AAPL": [_RAW_BAR]}
 
 
 class TestAuthenticator:
@@ -59,20 +65,33 @@ class TestParseBars:
         return MarketData(credentials=_CREDENTIALS)
 
     def test_empty_input_returns_empty_dataframe(self, market):
-        df = market._parse_bars([])
+        df = market._parse_bars({})
+        assert df.empty
+        assert list(df.columns) == _EXPECTED_COLUMNS
+
+    def test_symbol_without_bars_returns_empty_dataframe(self, market):
+        df = market._parse_bars({"AAPL": []})
         assert df.empty
         assert list(df.columns) == _EXPECTED_COLUMNS
 
     def test_output_has_expected_columns(self, market):
-        df = market._parse_bars([_RAW_BAR])
+        df = market._parse_bars(_RAW_BARS)
         assert list(df.columns) == _EXPECTED_COLUMNS
 
     def test_timestamp_is_utc_aware(self, market):
-        df = market._parse_bars([_RAW_BAR])
+        df = market._parse_bars(_RAW_BARS)
         assert df["timestamp_at"].dt.tz == timezone.utc
 
+    def test_symbol_is_taken_from_the_payload_key(self, market):
+        df = market._parse_bars(_RAW_BARS)
+        assert df["symbol"].tolist() == ["AAPL"]
+
+    def test_multiple_symbols_are_flattened_and_sorted(self, market):
+        df = market._parse_bars({"TSLA": [_RAW_BAR], "AAPL": [_RAW_BAR]})
+        assert df["symbol"].tolist() == ["AAPL", "TSLA"]
+
     def test_single_bar_values_are_mapped_correctly(self, market):
-        df = market._parse_bars([_RAW_BAR])
+        df = market._parse_bars(_RAW_BARS)
         row = df.iloc[0]
         assert row["open"] == pytest.approx(249.1)
         assert row["high"] == pytest.approx(249.25)
@@ -81,6 +100,103 @@ class TestParseBars:
         assert row["volume"] == 9049202
         assert row["trade_count"] == 128106
         assert row["vwap"] == pytest.approx(246.47)
+
+
+class FakeResponse:
+
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code}")
+
+
+class TestRequestHandling:
+    """Covers pagination and retries without touching the network."""
+
+    @pytest.fixture
+    def market(self, monkeypatch):
+        monkeypatch.setattr(MarketData, "_MAX_REQUESTS_PER_MINUTE", 60_000)
+        monkeypatch.setattr(time, "sleep", lambda _: None)
+        return MarketData(credentials=_CREDENTIALS)
+
+    def _patch_get(self, monkeypatch, responses):
+        calls = []
+
+        def fake_get(url, headers=None, params=None):
+            calls.append(dict(params))
+            return responses[len(calls) - 1]
+
+        monkeypatch.setattr(requests, "get", fake_get)
+
+        return calls
+
+    def test_follows_the_next_page_token(self, market, monkeypatch):
+        calls = self._patch_get(monkeypatch, [
+            FakeResponse({"bars": {"AAPL": [_RAW_BAR]}, "next_page_token": "page-2"}),
+            FakeResponse({"bars": {"AAPL": [_RAW_BAR]}, "next_page_token": None}),
+        ])
+
+        df = market.get_bars(symbol="AAPL", timeframe="1Min")
+
+        assert len(df) == 2
+        assert calls[1]["page_token"] == "page-2"
+
+    def test_first_request_carries_no_page_token(self, market, monkeypatch):
+        calls = self._patch_get(monkeypatch, [FakeResponse({"bars": {"AAPL": []}})])
+        market.get_bars(symbol="AAPL", timeframe="1Min")
+
+        assert "page_token" not in calls[0]
+
+    def test_feed_is_only_sent_when_requested(self, market, monkeypatch):
+        calls = self._patch_get(monkeypatch, [
+            FakeResponse({"bars": {}}), FakeResponse({"bars": {}}),
+        ])
+
+        market.get_bars(symbol="AAPL", timeframe="1Min")
+        market.get_bars(symbol="AAPL", timeframe="1Min", feed="sip")
+
+        assert "feed" not in calls[0]
+        assert calls[1]["feed"] == "sip"
+
+    def test_rate_limiting_is_retried(self, market, monkeypatch):
+        self._patch_get(monkeypatch, [
+            FakeResponse({}, status_code=429),
+            FakeResponse({"bars": {"AAPL": [_RAW_BAR]}}),
+        ])
+
+        assert len(market.get_bars(symbol="AAPL", timeframe="1Min")) == 1
+
+    def test_client_errors_are_raised_immediately(self, market, monkeypatch):
+        calls = self._patch_get(monkeypatch, [FakeResponse({}, status_code=403)])
+
+        with pytest.raises(requests.HTTPError):
+            market.get_bars(symbol="AAPL", timeframe="1Min")
+
+        assert len(calls) == 1
+
+    def test_corporate_actions_merge_across_pages(self, market, monkeypatch):
+        self._patch_get(monkeypatch, [
+            FakeResponse({
+                "corporate_actions": {"cash_dividends": [{"symbol": "AAPL", "ex_date": "2020-08-07", "rate": 0.82}]},
+                "next_page_token": "page-2",
+            }),
+            FakeResponse({
+                "corporate_actions": {
+                    "forward_splits": [{"symbol": "AAPL", "ex_date": "2020-08-31", "new_rate": 4, "old_rate": 1}]
+                },
+                "next_page_token": None,
+            }),
+        ])
+
+        actions = market.get_corporate_actions(symbol="AAPL")
+
+        assert sorted(actions["type"]) == ["cash_dividend", "split"]
 
 
 @pytest.mark.skipif(

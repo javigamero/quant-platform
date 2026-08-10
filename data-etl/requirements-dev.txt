@@ -1,4 +1,6 @@
+deltalake
 pandas
+pyarrow
 pytest
 python-dotenv
 requests
